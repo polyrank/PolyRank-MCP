@@ -1,0 +1,28 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-07-09/server.schema.json",
+  "name": "io.github.polyrank/polyrank-mcp",
+  "description": "Polymarket trader-skill analytics for AI agents — rank ~2.9M wallets by calibration (Brier), alpha-vs-mid, and risk-adjusted return, not vanity P&L. Free, read-only, wraps the public Polyrank API.",
+  "version": "0.2.0",
+  "repository": {
+    "url": "https://github.com/polyrank/PolyRank-MCP",
+    "source": "github"
+  },
+  "websiteUrl": "https://docs.polyrank.app/mcp",
+  "packages": [
+    {
+      "registryType": "npm",
+      "registryBaseUrl": "https://registry.npmjs.org",
+      "identifier": "@polyrank/mcp",
+      "version": "0.2.0",
+      "transport": { "type": "stdio" },
+      "environmentVariables": [
+        {
+          "name": "POLYRANK_API_BASE",
+          "description": "Override the Polyrank API host (default https://api.polyrank.app).",
+          "isRequired": false,
+          "isSecret": false
+        }
+      ]
+    }
+  ]
+}
