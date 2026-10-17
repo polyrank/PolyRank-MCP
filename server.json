@@ -1,8 +1,8 @@
 {
-  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-07-09/server.schema.json",
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.polyrank/polyrank-mcp",
-  "description": "Polymarket trader-skill analytics for AI agents — rank ~2.9M wallets by calibration (Brier), alpha-vs-mid, and risk-adjusted return, not vanity P&L. Free, read-only, wraps the public Polyrank API.",
-  "version": "0.2.0",
+  "description": "Polymarket trader analytics for AI agents: rank wallets, read trader metrics, backtest strategies.",
+  "version": "0.4.0",
   "repository": {
     "url": "https://github.com/polyrank/PolyRank-MCP",
     "source": "github"
@@ -13,14 +13,28 @@
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@polyrank/mcp",
-      "version": "0.2.0",
-      "transport": { "type": "stdio" },
+      "version": "0.4.0",
+      "transport": {
+        "type": "stdio"
+      },
       "environmentVariables": [
         {
           "name": "POLYRANK_API_BASE",
           "description": "Override the Polyrank API host (default https://api.polyrank.app).",
           "isRequired": false,
           "isSecret": false
+        },
+        {
+          "name": "POLYRANK_AGENT_BASE",
+          "description": "Override the agent host whose free manifests (metric catalog, metric windows, Builder goals) are read (default https://api-agent.polyrank.app).",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
+          "name": "POLYRANK_API_KEY",
+          "description": "Optional Polyrank API key (pk_live_…). Enables the authenticated tools: polyrank_rank_wallets (the Ranking Builder), polyrank_get_trader_metrics, the Strategy Lab tools and tid resolve. Anonymous tools work without it.",
+          "isRequired": false,
+          "isSecret": true
         }
       ]
     }
