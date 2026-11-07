@@ -1,19 +1,27 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.polyrank/polyrank-mcp",
+  "title": "Polyrank",
   "description": "Polymarket trader analytics for AI agents: rank wallets, read trader metrics, backtest strategies.",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "repository": {
     "url": "https://github.com/polyrank/PolyRank-MCP",
     "source": "github"
   },
   "websiteUrl": "https://docs.polyrank.app/mcp",
+  "icons": [
+    {
+      "src": "https://polyrank.app/icon.svg",
+      "mimeType": "image/svg+xml",
+      "sizes": ["any"]
+    }
+  ],
   "packages": [
     {
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@polyrank/mcp",
-      "version": "0.4.0",
+      "version": "0.5.0",
       "transport": {
         "type": "stdio"
       },
@@ -35,6 +43,28 @@
           "description": "Optional Polyrank API key (pk_live_…). Enables the authenticated tools: polyrank_rank_wallets (the Ranking Builder), polyrank_get_trader_metrics, the Strategy Lab tools and tid resolve. Anonymous tools work without it.",
           "isRequired": false,
           "isSecret": true
+        }
+      ]
+    }
+  ],
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://mcp.polyrank.app/mcp",
+      "headers": [
+        {
+          "name": "Authorization",
+          "description": "Optional. Your Polyrank API key as a bearer token (pk_live_…, from https://polyrank.app/api-keys). Without it the 17 free read-only tools work; the Ranking Builder, per-window trader metrics and the Strategy Lab tools need it (the Lab tools need a paid plan with the Lab; results are simulated).",
+          "isRequired": false,
+          "isSecret": true,
+          "value": "Bearer {api_key}",
+          "variables": {
+            "api_key": {
+              "description": "Your Polyrank API key (pk_live_…).",
+              "isRequired": true,
+              "isSecret": true
+            }
+          }
         }
       ]
     }
