@@ -1,6 +1,6 @@
 {
   "name": "@polyrank/mcp",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "mcpName": "io.github.polyrank/polyrank-mcp",
   "description": "MCP server for Polyrank — Polymarket trader skill analytics for AI agents.",
   "type": "module",

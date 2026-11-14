@@ -5,7 +5,7 @@
  *   - Free tools wrap the public /v1/public/* API and the free agent manifests (metric catalog, metric windows,
  *     Builder goals). No key.
  *   - With a Polyrank API key (a pk_live_… key from polyrank.app/api-keys), the ranking, trader-metrics and
- *     Strategy Lab tools call the authenticated API with the key: the SAME POST /v1/rankings/custom the Ranking Builder
+ *     AI Lab tools call the authenticated API with the key: the SAME POST /v1/rankings/custom the Ranking Builder
  *     runs (all metrics, weights, windows, filters, as_of), plan-gated and quota-counted like any key call. The API is
  *     the only authority on a key: this server grants nothing itself.
  *
@@ -25,8 +25,9 @@ import { realpathSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { McpServer, type ToolAnnotations } from '@modelcontextprotocol/server';
 import { z } from 'zod';
+import { MCP_KEY_TOOLS, MCP_ORIGIN } from './server_card.js';
 
-export const VERSION = '0.5.0';
+export const VERSION = '0.5.1';
 
 export const DEFAULT_API_BASE = 'https://api.polyrank.app';
 /** The x402 agent host. Only its FREE manifests are called (no payment is ever signed here). */
@@ -67,7 +68,7 @@ export const READ_ONLY = {
   openWorldHint: false,
 } as const satisfies ToolAnnotations;
 /**
- * The Strategy Lab writes: each creates or changes a record in the caller's own Polyrank account (a saved strategy, a
+ * The AI Lab writes: each creates or changes a record in the caller's own Polyrank account (a saved strategy, a
  * queued backtest, a paper run with no money, an edited strategy, an assistant chat and its answer, which spends the
  * account's AI credits). None deletes anything or touches funds (destructiveHint false); calling twice creates a second
  * record (idempotentHint false), except start_paper (one active run per strategy, 409 on a repeat), update_strategy
@@ -82,6 +83,24 @@ export const WRITE = {
 
 const WINDOWS = ['lifetime', '90d', '30d', '7d', '24h'] as const;
 
+/**
+ * A required `confirm: true` on the tools that spend AI credits, use a daily backtest or write to the account (the
+ * authed connector test, 2026-11-07: polyrank_lab_ask ran in claude.ai with no confirmation). The schema refuses a
+ * call without it, so a client cannot skip asking the user.
+ */
+/**
+ * How long a paper run lasts (founder 2026-11-09): the API's own numbers (packages/shared-types/src/lab_paper.ts —
+ * LAB_PAPER_DEFAULT_DAYS / MIN / MAX), repeated here because this package is published without workspace dependencies;
+ * test/start_paper_run_days.spec.ts requires them to match.
+ */
+export const PAPER_DEFAULT_DAYS = 10;
+export const PAPER_MIN_DAYS = 1;
+export const PAPER_MAX_DAYS = 90;
+
+const Confirm = z
+  .literal(true)
+  .describe('Required: true, and only after the user agreed to this call in the conversation.');
+
 const WeightValue = z.union([
   z.number().positive(),
   z.object({ weight: z.number().positive(), window: z.enum(WINDOWS).optional() }),
@@ -89,37 +108,234 @@ const WeightValue = z.union([
 
 function needsKeyMessage(transport: 'stdio' | 'http'): string {
   const get =
-    'This tool needs a Polyrank API key: create one at https://polyrank.app/api-keys (a plan with the Ranking Builder / Strategy Lab; the Strategy Lab tools need a paid plan with the Lab)';
+    'This tool needs a Polyrank API key: create one at https://polyrank.app/api-keys (a plan with the Ranking Builder / AI Lab; the AI Lab tools need a paid plan with the AI Lab)';
   return transport === 'http'
     ? `${get}, then connect to this server with the header "Authorization: Bearer pk_live_…".`
     : `${get}, then set POLYRANK_API_KEY in this MCP server's environment.`;
 }
 
-/** A tool result: pretty JSON text + the structured object (MCP's structuredContent must be a JSON object). */
-function ok(data: unknown) {
-  const structured =
-    data !== null && typeof data === 'object' && !Array.isArray(data)
-      ? (data as Record<string, unknown>)
-      : { result: data };
-  return {
-    content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }],
-    structuredContent: structured,
-  };
-}
 /**
- * A result that carries SIMULATED figures (a backtest, a paper run, a strategy's backtest headline, a chat's answer):
- * the object as `ok` returns it, plus the CFTC Rule 4.41 statement verbatim (Lab lead review 2026-11-07: every Lab
- * tool that shows a simulated figure carries it, as the page does under every simulated result).
+ * Carried by EVERY tool result, simulated or not (a live Claude-connector test, 2026-11-07: the non-simulated results
+ * had no disclaimer at all): a `disclaimer` field in the structured object and a second text block after the JSON, so
+ * the first block stays parseable JSON.
  */
-function okSimulated(data: unknown) {
+export const DATA_DISCLAIMER =
+  'Data, not investment advice. Polyrank is not affiliated with Polymarket.';
+
+/** The brand as the server spells it (the connector test saw a model write "PolyRank" throughout). */
+const BRAND = 'Polyrank (polyrank.app)';
+
+/**
+ * The 16 AI Lab tools: MCP_KEY_TOOLS after its first three (resolve_tid, rank_wallets, get_trader_metrics; the
+ * order server_card.ts lists them in). No tool name is quoted here: test/tool_inventory.spec.ts finds each tool's
+ * handler by the first quoted occurrence of its name in this file.
+ */
+export const LAB_TOOLS = MCP_KEY_TOOLS.slice(3);
+
+/** The server's `instructions` (MCP initialize result): who we are, the disclaimer, and which tools need a key. */
+export function serverInstructions(toolset: Toolset, transport: 'stdio' | 'http'): string {
+  const who =
+    `${BRAND} — spelled "Polyrank", one word — ranks Polymarket wallets by measured skill (calibration, alpha-vs-mid, ` +
+    `risk-adjusted return), not by raw P&L or win rate. ${DATA_DISCLAIMER} AI Lab results are simulated and ` +
+    'carry the CFTC Rule 4.41 statement (simulated_results_notice). Always show simulated_results_notice and ' +
+    'disclaimer to the user verbatim. Tools that spend AI credits, use a daily backtest or write to the account ' +
+    'take confirm: true: ask the user before calling them.';
+  const keyHow =
+    transport === 'http'
+      ? 'a Polyrank API key (Authorization: Bearer pk_live_…)'
+      : 'a Polyrank API key (POLYRANK_API_KEY)';
+  const keyed =
+    `polyrank_resolve_tid, polyrank_rank_wallets, polyrank_get_trader_metrics and the ${LAB_TOOLS.length} AI Lab ` +
+    `tools (${LAB_TOOLS.join(', ')})`;
+  const keyWhere =
+    'Any signed-in polyrank.app account, Free included, creates a key at https://polyrank.app/api-keys; limits ' +
+    'depend on the plan, and the AI Lab tools need a plan with the AI Lab.';
+  if (toolset === 'public') {
+    return (
+      `${who} This endpoint (${MCP_ORIGIN}/mcp/public) serves the free read-only tools and never uses a key. ` +
+      `${MCP_KEY_TOOLS.length} more tools are on ${MCP_ORIGIN}/mcp with ${keyHow}: ${keyed}. ${keyWhere}`
+    );
+  }
+  return `${who} The read-only tools work without a key; ${MCP_KEY_TOOLS.length} tools need ${keyHow}: ${keyed}. ${keyWhere}`;
+}
+
+/**
+ * A tool result: the notices FIRST, then the pretty JSON (MCP's structuredContent must be a JSON object). The authed
+ * connector test (2026-11-07) saw a client cut a long result at about 4 KB: a notice placed after the JSON never
+ * reached the user. So the short notices lead both the text blocks and the structured object's keys.
+ */
+function result(data: unknown, notice?: string) {
   const obj =
     data !== null && typeof data === 'object' && !Array.isArray(data)
       ? (data as Record<string, unknown>)
       : { result: data };
-  return ok({ ...obj, simulated_results_notice: CFTC_4_41_STATEMENT_TEXT });
+  // a chat view (chatView) carries the statement as one of its own keys: it leads like any other notice
+  if (notice === undefined && typeof obj['simulated_results_notice'] === 'string')
+    notice = obj['simulated_results_notice'];
+  const structured: Record<string, unknown> = {
+    ...(notice !== undefined ? { simulated_results_notice: notice } : {}),
+    disclaimer: DATA_DISCLAIMER,
+    ...obj,
+  };
+  // the notices win over a same-named upstream field, and keep their leading position
+  structured['disclaimer'] = DATA_DISCLAIMER;
+  if (notice !== undefined) structured['simulated_results_notice'] = notice;
+  return {
+    content: [
+      ...(notice !== undefined ? [{ type: 'text' as const, text: notice }] : []),
+      { type: 'text' as const, text: DATA_DISCLAIMER },
+      { type: 'text' as const, text: JSON.stringify(data, null, 2) },
+    ],
+    structuredContent: structured,
+  };
+}
+function ok(data: unknown) {
+  return result(data);
+}
+/**
+ * A result that carries SIMULATED figures (a backtest, a paper run, a strategy's backtest headline, a chat's answer):
+ * the CFTC Rule 4.41 statement verbatim, as the first text block and the first structured key (Lab lead review
+ * 2026-11-07: every Lab tool that shows a simulated figure carries it, as the page does under every simulated result).
+ */
+function okSimulated(data: unknown) {
+  return result(data, CFTC_4_41_STATEMENT_TEXT);
 }
 function fail(message: string) {
   return { content: [{ type: 'text' as const, text: message }], isError: true };
+}
+
+/**
+ * The leaderboard's history boards (packages/billing history_board_keys.ts HISTORY_BOARD_KEYS; the key is also the
+ * board's preset slug). This package ships to npm without the workspace, so the four keys are written here and
+ * test/connector_fixes.spec.ts pins them to the billing list.
+ */
+export const HISTORY_BOARDS = [
+  'underdog-specialists',
+  'copier-consensus',
+  'predictors-early-underdog',
+  'sports-closing-line',
+] as const;
+/** What a history board accepts besides filters.history_board: the preset route's own query parameters. */
+const HISTORY_BOARD_FILTERS = new Set([
+  'history_board',
+  'active_within_days',
+  'active_within_hours',
+  'best_category',
+]);
+const HISTORY_BOARD_QUERY = [
+  'limit',
+  'offset',
+  'sort_by',
+  'sort_dir',
+  'include_breakdown',
+  'include_verdict',
+  'dedupe_clusters',
+  'extra_metrics',
+  'extra_engine_metrics',
+] as const;
+
+/**
+ * A ranking body with filters.history_board → the preset call that serves it, a refusal that says why, or null (not a
+ * history board). POST /v1/rankings/custom refuses history_board itself (a preset-only filter) and a history board
+ * carries no weights (the authed connector test, 2026-11-07: the tool asked for weights, the API refused them, five
+ * tries), so this tool serves it from GET /v1/rankings/preset/<board>.
+ */
+/**
+ * The copy-engine columns that are SIMULATED performance (a measured cost and fee model applied to copies nobody
+ * placed): the 30-day in-band copy return and the taker in-band P&L. A rank_wallets result that sorts by one or
+ * projects one carries the CFTC Rule 4.41 statement first, exactly as the web's board columns flagged
+ * `simulated: true` sit under SimulatedPerformanceNotice (Drop 18 verify, 2026-11-07: the founder's connector got
+ * +52 % in-band returns with only the data disclaimer). Skill scores and ages (sk_score_14d, signal_freshness_hours …)
+ * are measured properties, not returns, and stay plain. A history board is an AI Lab ranking's seat — simulated
+ * by construction — so it carries the statement too.
+ */
+export const SIMULATED_ENGINE_METRICS: readonly string[] = [
+  'inband_return_30d',
+  'taker_inband_pnl_14d',
+];
+export function rankWalletsShowsSimulated(body: Record<string, unknown>): boolean {
+  const sort = typeof body['sort_by'] === 'string' ? body['sort_by'] : '';
+  if (SIMULATED_ENGINE_METRICS.some((id) => sort === `engine:${id}`)) return true;
+  const extra = body['extra_engine_metrics'];
+  if (Array.isArray(extra) && extra.some((id) => SIMULATED_ENGINE_METRICS.includes(String(id))))
+    return true;
+  const filters = body['filters'];
+  return (
+    typeof filters === 'object' &&
+    filters !== null &&
+    'history_board' in (filters as Record<string, unknown>)
+  );
+}
+
+export function historyBoardCall(
+  body: Record<string, unknown>,
+): { path: string } | { error: string } | null {
+  const filters = body['filters'];
+  if (filters === null || typeof filters !== 'object' || !('history_board' in filters)) return null;
+  const f = filters as Record<string, unknown>;
+  const hb = f['history_board'];
+  const board =
+    hb !== null && typeof hb === 'object' ? (hb as Record<string, unknown>)['board'] : undefined;
+  if (typeof board !== 'string' || !(HISTORY_BOARDS as readonly string[]).includes(board))
+    return {
+      error: `filters.history_board takes {board} only, board one of: ${HISTORY_BOARDS.join(', ')}.`,
+    };
+  const extraHb = Object.keys(hb as object).filter((k) => k !== 'board');
+  if (extraHb.length > 0)
+    return {
+      error: `filters.history_board takes {board} only; not accepted: ${extraHb.join(', ')}.`,
+    };
+  const w = body['weights'];
+  if (w !== undefined && (typeof w !== 'object' || w === null || Object.keys(w).length > 0))
+    return {
+      error:
+        'a history board is ranked by its seat and carries no weights: drop weights (and window).',
+    };
+  const badFilters = Object.keys(f).filter((k) => !HISTORY_BOARD_FILTERS.has(k));
+  if (badFilters.length > 0)
+    return {
+      error: `a history board accepts only active_within_days, active_within_hours and best_category besides history_board; not accepted: ${badFilters.join(', ')}.`,
+    };
+  if (body['as_of'] !== undefined)
+    return { error: 'a history board has no as_of: it is the latest nightly seat.' };
+  const q = new URLSearchParams();
+  for (const k of ['active_within_days', 'active_within_hours', 'best_category'])
+    if (f[k] !== undefined) q.set(k, String(f[k]));
+  for (const k of HISTORY_BOARD_QUERY) {
+    const v = body[k];
+    if (v === undefined) continue;
+    q.set(k, Array.isArray(v) ? v.join(',') : String(v));
+  }
+  const qs = q.toString();
+  return { path: `/v1/rankings/preset/${encodeURIComponent(board)}${qs ? `?${qs}` : ''}` };
+}
+
+/**
+ * polyrank_get_lab_limits in credits, never dollars (the credits-never-dollars rule; the authed connector test,
+ * 2026-11-07, saw "agent_daily_usd: 20" and no balance): the plan limits without their dollar key, plus the credit
+ * balance from GET /v1/lab/credits — the same source as /account/usage and the plan card.
+ */
+export function labLimitsView(
+  limits: Record<string, unknown>,
+  credits: Record<string, unknown>,
+): Record<string, unknown> {
+  const { agent_daily_usd: _usd, ...rest } = limits;
+  if ('error' in credits) return { ...rest, credits: null, credits_error: credits['error'] };
+  const int = (v: unknown) => (typeof v === 'number' ? v : null);
+  return {
+    ...rest,
+    credits_balance: int(credits['total']),
+    credits_allowance_left: int(credits['allowance']),
+    credits_topup: int(credits['topup']),
+    credits_used_today: int(credits['spent_today']),
+    daily_ceiling_credits: int(credits['daily_ceiling']),
+    credits_allowance_granted: int(credits['allowance_granted']),
+    credits_resets: typeof credits['resets_label'] === 'string' ? credits['resets_label'] : null,
+    typical_question_credits: int(credits['typical_turn_credits']),
+    question_reserve_credits: int(credits['reserve']),
+    credits_blocked: credits['blocked'] ?? null,
+    credits_blocked_message: credits['blocked_message'] ?? null,
+  };
 }
 
 /** Build one MCP server. stdio builds one per connection, HTTP one per request (stateless). */
@@ -194,7 +410,39 @@ export function createPolyrankServer(opts: PolyrankServerOptions): McpServer {
     return call<T>(API_BASE, path);
   }
 
-  const server = new McpServer({ name: 'polyrank', version: VERSION });
+  const server = new McpServer(
+    { name: 'polyrank', version: VERSION },
+    { instructions: serverInstructions(toolset, opts.transport) },
+  );
+  /**
+   * Every tool's `annotations.title` is its `title` (2026-11-14). The MCP specification carries a display name in two
+   * places, the tool's top-level `title` and `annotations.title`, and a client or a directory may read either one:
+   * Claude's connector directory read all 36 tools from the hosted server and flagged each "Missing title annotation.
+   * Add annotations.title". Set here, once, for every tool registered below, so the two can never differ and a new
+   * tool cannot be added without it; test/http_transport.spec.ts pins it on both tool lists.
+   */
+  const registerTool = server.registerTool.bind(server) as (...args: unknown[]) => unknown;
+  server.registerTool = ((
+    name: string,
+    config: { title?: string; annotations?: ToolAnnotations },
+    handler: unknown,
+  ) =>
+    registerTool(
+      name,
+      {
+        ...config,
+        annotations: { ...config.annotations, title: config.annotations?.title ?? config.title },
+      },
+      handler,
+    )) as typeof server.registerTool;
+  /**
+   * A keyed tool named in a FREE tool's text: on /mcp/public it is not listed, so the text says where it is. Backticks,
+   * not quotes: test/tool_inventory.spec.ts finds a tool's handler by the first single-quoted occurrence of its name.
+   */
+  const RANK_WALLETS =
+    toolset === 'public'
+      ? `polyrank_rank_wallets (available on the full server with an API key)`
+      : `polyrank_rank_wallets`;
 
   // ── Read-only, free, no key (17). Listed first. ──
 
@@ -294,7 +542,7 @@ export function createPolyrankServer(opts: PolyrankServerOptions): McpServer {
     {
       title: 'Polyrank live pulse',
       description:
-        'Live Polymarket activity: big wins just banked (realized profit), sharp-money moves, the biggest recent trades, trending markets by volume, and markets where Polyrank consensus diverges most from the market mid. Good for "what is smart money doing right now".',
+        'Live Polymarket activity: big wins just banked (realized profit), sharp-money moves, the biggest recent trades, trending markets by volume, and markets where Polyrank consensus diverges most from the market mid. Good for "what are the big and sharp wallets doing right now".',
       inputSchema: z.object({}),
       annotations: READ_ONLY,
       _meta: FREE,
@@ -564,8 +812,7 @@ export function createPolyrankServer(opts: PolyrankServerOptions): McpServer {
     'polyrank_get_metrics_catalog',
     {
       title: 'Polyrank metric catalog (every rankable metric)',
-      description:
-        'The full catalog of displayable Polyrank metrics (84): id, name, description, category, direction (higher/lower is better), the windows each is available at, and whether it is advanced. This is the vocabulary for polyrank_rank_wallets weights, skill_gates and metric_filters. Free, no key.',
+      description: `The full catalog of displayable Polyrank metrics (84): id, name, description, category, direction (higher/lower is better), the windows each is available at, and whether it is advanced. This is the vocabulary for the weights, skill_gates and metric_filters of ${RANK_WALLETS}. Free, no key.`,
       inputSchema: z.object({}),
       annotations: READ_ONLY,
       _meta: FREE,
@@ -602,8 +849,7 @@ export function createPolyrankServer(opts: PolyrankServerOptions): McpServer {
     'polyrank_list_ranking_templates',
     {
       title: 'Polyrank ranking templates (Builder goals + presets)',
-      description:
-        'The Ranking Builder\'s goals (e.g. "Copy entries", "Copy engine") as the exact request the Builder runs for each, and the site\'s preset boards with their configs. Pass a goal\'s `request` (or a preset\'s config) to polyrank_rank_wallets to reproduce that board, or edit it. A goal `banner` is a measured caveat to show with the board. Free, no key.',
+      description: `The Ranking Builder's goals (e.g. "Copy entries", "Copy engine") as the exact request the Builder runs for each, and the site's preset boards with their configs. Pass a goal's \`request\` (or a preset's config) to ${RANK_WALLETS} to reproduce that board, or edit it. A goal \`banner\` is a measured caveat to show with the board. Free, no key.`,
       inputSchema: z.object({}),
       annotations: READ_ONLY,
       _meta: FREE,
@@ -626,7 +872,7 @@ export function createPolyrankServer(opts: PolyrankServerOptions): McpServer {
   // The 9 tools below are scoped to a Polyrank account. The public endpoint (toolset "public") lists none of them.
   if (toolset === 'public') return server;
 
-  // ── Read-only, with a key (3 + 3 Strategy Lab reads). ──
+  // ── Read-only, with a key (3 + 3 AI Lab reads). ──
 
   server.registerTool(
     'polyrank_resolve_tid',
@@ -654,8 +900,7 @@ export function createPolyrankServer(opts: PolyrankServerOptions): McpServer {
     'polyrank_rank_wallets',
     {
       title: 'Polyrank Ranking Builder (custom composite ranking)',
-      description:
-        'Rank every Polymarket wallet with your own composite — exactly what the Ranking Builder runs (POST /v1/rankings/custom). weights: metric id → weight (or {weight, window}); any of the 84 catalog metrics at any window it exists at (polyrank_get_metric_windows), plus copy-engine (sk_score_14d) and entry-timing ids at lifetime. filters: min_trades, min_resolved, min_volume_usdc, min_realized_pnl(_net_fees), min_win_rate_pct, max_roi_pct, active_within_days/hours, categories, exclude_bonders, skill_gates [{metric,min_pctile,window}], metric_filters [{metric,min,max,window}], copy_engine {sleeve}, timing {sub,bucket,window,min_n}, cluster_policy, copy_placeable, smart_money_tags_any_of, follower_count_max … (the server rejects anything it cannot apply, with the reason). as_of=YYYY-MM-DD ranks the board as it stood that day (lifetime snapshot metrics only — refused with the reason otherwise, never answered live). To reproduce a Builder goal, pass its `request` from polyrank_list_ranking_templates as `request`. Needs POLYRANK_API_KEY (a plan with the Builder).',
+      description: `Rank every Polymarket wallet with your own composite — exactly what the Ranking Builder runs (POST /v1/rankings/custom). weights: metric id → weight (or {weight, window}); any of the 84 catalog metrics at any window it exists at (polyrank_get_metric_windows), plus copy-engine (sk_score_14d) and entry-timing ids at lifetime. filters: min_trades, min_resolved, min_inband_n_30d (the in-band positions behind inband_return_30d: a sort by engine:inband_return_30d applies 10 unless you set it, 1 = every measured wallet; the floor that ran is in applied_filters), min_volume_usdc, min_realized_pnl(_net_fees), min_win_rate_pct, max_roi_pct, active_within_days/hours, categories, exclude_bonders, skill_gates [{metric,min_pctile,window}], metric_filters [{metric,min,max,window}], copy_engine {sleeve}, timing {sub,bucket,window,min_n}, cluster_policy, copy_placeable, smart_money_tags_any_of, follower_count_max … (the server rejects anything it cannot apply, with the reason). A HISTORY BOARD (an AI Lab history ranking's latest seat) is filters {history_board: {board}} with board one of ${HISTORY_BOARDS.join(' | ')} and NO weights: it is ranked by the seat's own order and served as that preset board; only active_within_days, active_within_hours and best_category may narrow it (window_days, score, min_positions, one_per_operator and other keys are not accepted there), plus limit, offset, sort_by, sort_dir, include_breakdown, include_verdict, extra_metrics, extra_engine_metrics, dedupe_clusters. as_of=YYYY-MM-DD ranks the board as it stood that day (lifetime snapshot metrics only — refused with the reason otherwise, never answered live). To reproduce a Builder goal, pass its \`request\` from polyrank_list_ranking_templates as \`request\`. Needs POLYRANK_API_KEY (a plan with the Builder).`,
       inputSchema: z.object({
         request: z
           .record(z.string(), z.unknown())
@@ -687,7 +932,7 @@ export function createPolyrankServer(opts: PolyrankServerOptions): McpServer {
           .string()
           .optional()
           .describe(
-            'composite (default), metric:<id>, pctile:<id>, engine:<id>, timing:<id>, or a board column.',
+            'composite (default), metric:<id>, pctile:<id>, engine:<id>, timing:<id>, or a board column. engine:inband_return_30d is a mean over few positions for most wallets: it carries a min_inband_n_30d floor (default 10) and projects inband_n_30d beside it.',
           ),
         sort_dir: z.enum(['desc', 'asc']).optional(),
         limit: z.number().int().min(1).max(500).optional().describe('Rows (default 100, max 500).'),
@@ -735,9 +980,15 @@ export function createPolyrankServer(opts: PolyrankServerOptions): McpServer {
           );
         }
         for (const [k, v] of Object.entries(rest)) if (v !== undefined) body[k] = v;
+        const history = historyBoardCall(body);
+        if (history !== null) {
+          if ('error' in history) return fail(history.error);
+          return okSimulated(await api(history.path));
+        }
         if (body['weights'] === undefined)
           return fail('give weights (metric id → weight) or a template `request`.');
-        return ok(await call(API_BASE, '/v1/rankings/custom', { method: 'POST', body }));
+        const board = await call(API_BASE, '/v1/rankings/custom', { method: 'POST', body });
+        return rankWalletsShowsSimulated(body) ? okSimulated(board) : ok(board);
       } catch (e) {
         return fail((e as Error).message);
       }
@@ -785,9 +1036,9 @@ export function createPolyrankServer(opts: PolyrankServerOptions): McpServer {
   server.registerTool(
     'polyrank_list_lab_templates',
     {
-      title: 'Strategy Lab templates',
+      title: 'Polyrank AI Lab templates',
       description:
-        "The Strategy Lab's templates: research strategy families as editable strategy specs, each with its as-of evidence (SIMULATED, per $10 copied) and caveats. Copy one's `spec` (or its id) into polyrank_create_strategy / polyrank_run_backtest. Needs POLYRANK_API_KEY.",
+        "The AI Lab's templates: research strategy families as editable strategy specs, each with its as-of evidence (SIMULATED, per $10 copied) and caveats. Copy one's `spec` (or its id) into polyrank_create_strategy / polyrank_run_backtest. Needs POLYRANK_API_KEY.",
       inputSchema: z.object({}),
       annotations: READ_ONLY,
       _meta: LAB,
@@ -805,7 +1056,7 @@ export function createPolyrankServer(opts: PolyrankServerOptions): McpServer {
   server.registerTool(
     'polyrank_get_backtest',
     {
-      title: 'Strategy Lab: a backtest and its report',
+      title: 'Polyrank AI Lab: a backtest and its report',
       description:
         'A backtest by id: its status (queued / running / done / failed) and, when done, the full SIMULATED report (per-$10 P&L, copies, the no-selection control, without-best-wallet, capacity, funnel, per wallet, daily). Needs POLYRANK_API_KEY.',
       inputSchema: z.object({ id: z.string().uuid() }),
@@ -825,7 +1076,7 @@ export function createPolyrankServer(opts: PolyrankServerOptions): McpServer {
   server.registerTool(
     'polyrank_get_paper_run',
     {
-      title: 'Strategy Lab: a paper run',
+      title: 'Polyrank AI Lab: a paper run',
       description:
         "A paper run by id with the grader's stats (copies, resolved, P&L per $10, entry vs the leader, the paper gate) and its copies, each with its fate (copied / no_fill / leader_sold / capped / skipped + reason). Needs POLYRANK_API_KEY.",
       inputSchema: z.object({
@@ -857,7 +1108,7 @@ export function createPolyrankServer(opts: PolyrankServerOptions): McpServer {
   server.registerTool(
     'polyrank_list_strategies',
     {
-      title: 'Strategy Lab: your strategies',
+      title: 'Polyrank AI Lab: your strategies',
       description:
         "Your saved strategies, newest first, each with its state and its latest backtest's headline (per $10 copied, copies; SIMULATED). `status` lists only one state: draft, backtested (tested), paper (paper trading), promotable (passed the paper gate), live, archived. Needs POLYRANK_API_KEY.",
       inputSchema: z.object({
@@ -884,7 +1135,7 @@ export function createPolyrankServer(opts: PolyrankServerOptions): McpServer {
   server.registerTool(
     'polyrank_get_strategy',
     {
-      title: 'Strategy Lab: one strategy',
+      title: 'Polyrank AI Lab: one strategy',
       description:
         'One of your strategies by id: its name, state and full strategy spec (wallet source, market, entry, sizing, exit). Edit it with polyrank_update_strategy. Needs POLYRANK_API_KEY.',
       inputSchema: z.object({ id: z.string().uuid() }),
@@ -904,7 +1155,7 @@ export function createPolyrankServer(opts: PolyrankServerOptions): McpServer {
   server.registerTool(
     'polyrank_list_backtests',
     {
-      title: 'Strategy Lab: your backtests',
+      title: 'Polyrank AI Lab: your backtests',
       description:
         "Your recent backtests (all, or one strategy's), newest first, with status and headline (SIMULATED). Read one in full with polyrank_get_backtest. Needs POLYRANK_API_KEY.",
       inputSchema: z.object({
@@ -931,9 +1182,9 @@ export function createPolyrankServer(opts: PolyrankServerOptions): McpServer {
   server.registerTool(
     'polyrank_get_lab_limits',
     {
-      title: 'Strategy Lab: your plan limits and use',
+      title: 'Polyrank AI Lab: your plan limits and use',
       description:
-        "Your plan's Strategy Lab limits and what is used now: backtests a day and today's, backtests waiting, paper runs at once, saved strategies, and the assistant chats answering at once (lab_agent_concurrent) against those answering now. Needs POLYRANK_API_KEY.",
+        "Your plan's AI Lab limits and what is used now: backtests a day and today's, backtests waiting, paper runs at once, saved strategies, the assistant chats answering at once (lab_agent_concurrent) against those answering now, and the AI credits: credits_balance (allowance left + top-ups), credits_used_today, daily_ceiling_credits (null: none), when the allowance resets, what a typical question costs. In credits, never dollars. Needs POLYRANK_API_KEY.",
       inputSchema: z.object({}),
       annotations: READ_ONLY,
       _meta: LAB,
@@ -941,7 +1192,13 @@ export function createPolyrankServer(opts: PolyrankServerOptions): McpServer {
     async () => {
       if (!API_KEY) return fail(NEEDS_KEY);
       try {
-        return ok(await api('/v1/lab/limits'));
+        const [limits, credits] = await Promise.all([
+          api<Record<string, unknown>>('/v1/lab/limits'),
+          api<Record<string, unknown>>('/v1/lab/credits').catch((e: Error) => ({
+            error: e.message,
+          })),
+        ]);
+        return ok(labLimitsView(limits, credits));
       } catch (e) {
         return fail((e as Error).message);
       }
@@ -951,9 +1208,9 @@ export function createPolyrankServer(opts: PolyrankServerOptions): McpServer {
   server.registerTool(
     'polyrank_lab_list_chats',
     {
-      title: 'Lab assistant: your chats',
+      title: 'Polyrank AI Lab assistant: your chats',
       description:
-        'Your Lab assistant chats, most recent first (at most 100): id, title, status (idle / queued / working / failed). Read one with polyrank_lab_get_chat. Needs POLYRANK_API_KEY (a paid plan; the assistant is part of every paid plan).',
+        'Your AI Lab assistant chats, most recent first (at most 100): id, title, status (idle / queued / working / failed). Read one with polyrank_lab_get_chat. Needs POLYRANK_API_KEY (a paid plan; the assistant is part of every paid plan).',
       inputSchema: z.object({}),
       annotations: READ_ONLY,
       _meta: LAB,
@@ -974,9 +1231,9 @@ export function createPolyrankServer(opts: PolyrankServerOptions): McpServer {
   server.registerTool(
     'polyrank_lab_get_chat',
     {
-      title: 'Lab assistant: one chat',
+      title: 'Polyrank AI Lab assistant: one chat',
       description:
-        "One of your Lab assistant chats: its status, the questions and the assistant's answers with their notices and result cards (backtests, shortlists, strategies, tables). While a question waits, `queue_position` says how many are ahead; `awaiting_backtests` counts backtests the assistant started whose result will be posted to the chat by itself. Backtest and paper figures are SIMULATED. Needs POLYRANK_API_KEY.",
+        "One of your AI Lab assistant chats: its status, the questions and the assistant's answers with their notices and result cards (backtests, shortlists, strategies, tables). While a question waits, `queue_position` says how many are ahead; `awaiting_backtests` counts backtests the assistant started whose result will be posted to the chat by itself. Backtest and paper figures are SIMULATED. Needs POLYRANK_API_KEY.",
       inputSchema: z.object({
         id: z.string().uuid(),
         last: z
@@ -1000,15 +1257,15 @@ export function createPolyrankServer(opts: PolyrankServerOptions): McpServer {
     },
   );
 
-  // ── Writes (Strategy Lab, 7). Each creates or changes a record in the caller's own account; none deletes, none
+  // ── Writes (AI Lab, 7). Each creates or changes a record in the caller's own account; none deletes, none
   // touches funds. The chat tools spend the account's AI credits. Listed last. ──
 
   server.registerTool(
     'polyrank_create_strategy',
     {
-      title: 'Strategy Lab: save a strategy',
+      title: 'Polyrank AI Lab: save a strategy',
       description:
-        'Save a strategy to your Lab: a name plus a strategy spec (wallet source — any Builder ranking, a history ranking, a static wallet list or a copy-engine sleeve — and market, entry, sizing and exit rules), or a template_id to copy a template. The server validates the spec and answers with the reason when it refuses. Needs POLYRANK_API_KEY.',
+        "Writes to the user's AI Lab: ask the user before calling, then pass confirm: true. Save a strategy to your AI Lab: a name plus a strategy spec (wallet source — any Builder ranking, a history ranking, a static wallet list or a copy-engine sleeve — and market, entry, sizing and exit rules), or a template_id to copy a template. The server validates the spec and answers with the reason when it refuses. Needs POLYRANK_API_KEY.",
       inputSchema: z.object({
         name: z.string().min(1).max(120),
         spec: z
@@ -1016,6 +1273,7 @@ export function createPolyrankServer(opts: PolyrankServerOptions): McpServer {
           .optional()
           .describe('A strategy spec (see polyrank_list_lab_templates).'),
         template_id: z.string().optional(),
+        confirm: Confirm,
       }),
       annotations: WRITE,
       _meta: LAB,
@@ -1038,9 +1296,9 @@ export function createPolyrankServer(opts: PolyrankServerOptions): McpServer {
   server.registerTool(
     'polyrank_run_backtest',
     {
-      title: 'Strategy Lab: run a backtest',
+      title: 'Polyrank AI Lab: run a backtest',
       description:
-        "Queue a backtest of a saved strategy (strategy_id) or an unsaved spec over [from, to) (ISO dates, at most 366 days), optionally with explicit re-rank cuts. Answers with the queued run; poll polyrank_get_backtest. Results are SIMULATED (each report names its fill model and measured optimism). Counts against your plan's daily backtests. Needs POLYRANK_API_KEY.",
+        "Uses one of the plan's daily backtests: ask the user before calling, then pass confirm: true. Queue a backtest of a saved strategy (strategy_id) or an unsaved spec over [from, to) (ISO dates, at most 366 days), optionally with explicit re-rank cuts. Answers with the queued run; poll polyrank_get_backtest. Results are SIMULATED (each report names its fill model and measured optimism). Counts against your plan's daily backtests. Needs POLYRANK_API_KEY.",
       inputSchema: z.object({
         strategy_id: z.string().uuid().optional(),
         spec: z.record(z.string(), z.unknown()).optional(),
@@ -1050,6 +1308,7 @@ export function createPolyrankServer(opts: PolyrankServerOptions): McpServer {
           .array(z.string().regex(/^\d{4}-\d{2}-\d{2}$/))
           .max(60)
           .optional(),
+        confirm: Confirm,
       }),
       annotations: WRITE,
       _meta: LAB,
@@ -1057,7 +1316,8 @@ export function createPolyrankServer(opts: PolyrankServerOptions): McpServer {
     async (args) => {
       if (!API_KEY) return fail(NEEDS_KEY);
       try {
-        const body = Object.fromEntries(Object.entries(args).filter(([, v]) => v !== undefined));
+        const { confirm: _confirm, ...rest } = args;
+        const body = Object.fromEntries(Object.entries(rest).filter(([, v]) => v !== undefined));
         return okSimulated(await call(API_BASE, '/v1/lab/backtests', { method: 'POST', body }));
       } catch (e) {
         return fail((e as Error).message);
@@ -1068,19 +1328,33 @@ export function createPolyrankServer(opts: PolyrankServerOptions): McpServer {
   server.registerTool(
     'polyrank_start_paper',
     {
-      title: 'Strategy Lab: start paper trading',
-      description:
-        'Start paper trading a saved strategy: from now on every signal of its wallets is scored against the real order book (no orders, no keys, no money). One active run per strategy. Needs POLYRANK_API_KEY (plan feature paper_trading).',
-      inputSchema: z.object({ strategy_id: z.string().uuid() }),
+      title: 'Polyrank AI Lab: start paper trading',
+      description: `Writes to the user's AI Lab: ask the user before calling, then pass confirm: true. Start paper trading a saved strategy: from now on every signal of its wallets is scored against the real order book (no orders, no keys, no money). The run lasts ${PAPER_DEFAULT_DAYS} days unless run_days says otherwise (a whole number of days, ${PAPER_MIN_DAYS} to ${PAPER_MAX_DAYS}, only when the user asked for that length; null = no end, it runs until stopped). The result's ends_at is when it stops by itself (null = no end; open copies still settle after it): tell the user, and that they can change it on the run's page at polyrank.app. One active run per strategy. Needs POLYRANK_API_KEY (plan feature paper_trading).`,
+      inputSchema: z.object({
+        strategy_id: z.string().uuid(),
+        run_days: z
+          .number()
+          .int()
+          .min(PAPER_MIN_DAYS)
+          .max(PAPER_MAX_DAYS)
+          .nullable()
+          .optional()
+          .describe(
+            `How many days the run lasts (default ${PAPER_DEFAULT_DAYS}); null = no end, it runs until the user stops it.`,
+          ),
+        confirm: Confirm,
+      }),
       annotations: { ...WRITE, idempotentHint: true },
       _meta: LAB,
     },
-    async ({ strategy_id }) => {
+    async ({ strategy_id, run_days }) => {
       if (!API_KEY) return fail(NEEDS_KEY);
       try {
         return ok(
           await call(API_BASE, `/v1/lab/strategies/${encodeURIComponent(strategy_id)}/paper`, {
             method: 'POST',
+            // no run_days = no body, as before: the API applies its default length
+            ...(run_days === undefined ? {} : { body: { run_days } }),
           }),
         );
       } catch (e) {
@@ -1092,13 +1366,14 @@ export function createPolyrankServer(opts: PolyrankServerOptions): McpServer {
   server.registerTool(
     'polyrank_update_strategy',
     {
-      title: 'Strategy Lab: edit a strategy',
+      title: 'Polyrank AI Lab: edit a strategy',
       description:
-        'Rename a saved strategy and/or replace its strategy spec (a changed spec makes it a draft again: its earlier backtests stay, tested on the old rules). The server validates the spec and answers with the reason when it refuses. Needs POLYRANK_API_KEY.',
+        "Writes to the user's AI Lab: ask the user before calling, then pass confirm: true. Rename a saved strategy and/or replace its strategy spec (a changed spec makes it a draft again: its earlier backtests stay, tested on the old rules). The server validates the spec and answers with the reason when it refuses. Needs POLYRANK_API_KEY.",
       inputSchema: z.object({
         id: z.string().uuid(),
         name: z.string().min(1).max(120).optional(),
         spec: z.record(z.string(), z.unknown()).optional(),
+        confirm: Confirm,
       }),
       annotations: { ...WRITE, idempotentHint: true },
       _meta: LAB,
@@ -1141,13 +1416,14 @@ export function createPolyrankServer(opts: PolyrankServerOptions): McpServer {
   server.registerTool(
     'polyrank_lab_ask',
     {
-      title: 'Lab assistant: ask in a new chat',
+      title: 'Polyrank AI Lab assistant: ask in a new chat',
       description:
-        "Start a Lab assistant chat with a question (research only: it finds traders, saves, backtests and paper-trades strategies in YOUR account, never places orders). Spends your plan's AI credits (a question needs 25 to start; a typical one costs about 13; `deep: true` runs the slower, more thorough mode, about twice the credits, Lab Pro and up). Your plan answers a number of chats at once (Pro Trader 2 … Enterprise 8; one more is refused 429 lab_agent_busy). Waits up to `wait_seconds` (default 45, max 55) for the answer; if it is still working, poll polyrank_lab_get_chat with the returned id. A long backtest it starts answers at once and its result is posted to the chat later. Results are SIMULATED. Needs POLYRANK_API_KEY.",
+        "Spends the account's AI credits: ask the user before calling, then pass confirm: true. Start an AI Lab assistant chat with a question (research only: it finds traders, saves, backtests and paper-trades strategies in YOUR account, never places orders). Spends your plan's AI credits (a question needs 25 to start; a typical one costs about 13; `deep: true` runs the slower, more thorough mode, about twice the credits, Lab Pro and up). Your plan answers a number of chats at once (Pro Trader 2 … Enterprise 8; one more is refused 429 lab_agent_busy). Waits up to `wait_seconds` (default 45, max 55) for the answer; if it is still working, poll polyrank_lab_get_chat with the returned id. A long backtest it starts answers at once and its result is posted to the chat later. Results are SIMULATED. Needs POLYRANK_API_KEY.",
       inputSchema: z.object({
         message: z.string().min(1).max(8000),
         deep: z.boolean().optional(),
         wait_seconds: z.number().int().min(0).max(CHAT_WAIT_MAX_S).optional(),
+        confirm: Confirm,
       }),
       annotations: WRITE,
       _meta: LAB,
@@ -1169,13 +1445,14 @@ export function createPolyrankServer(opts: PolyrankServerOptions): McpServer {
   server.registerTool(
     'polyrank_lab_reply',
     {
-      title: 'Lab assistant: reply in a chat',
+      title: 'Polyrank AI Lab assistant: reply in a chat',
       description:
-        'Send the next message in one of your Lab assistant chats (409 while it is still answering). Spends AI credits like polyrank_lab_ask and waits the same way for the answer. Needs POLYRANK_API_KEY.',
+        "Spends the account's AI credits: ask the user before calling, then pass confirm: true. Send the next message in one of your AI Lab assistant chats (409 while it is still answering). Spends AI credits like polyrank_lab_ask and waits the same way for the answer. Needs POLYRANK_API_KEY.",
       inputSchema: z.object({
         id: z.string().uuid(),
         message: z.string().min(1).max(8000),
         wait_seconds: z.number().int().min(0).max(CHAT_WAIT_MAX_S).optional(),
+        confirm: Confirm,
       }),
       annotations: WRITE,
       _meta: LAB,
@@ -1194,9 +1471,9 @@ export function createPolyrankServer(opts: PolyrankServerOptions): McpServer {
   server.registerTool(
     'polyrank_lab_stop',
     {
-      title: 'Lab assistant: stop an answer',
+      title: 'Polyrank AI Lab assistant: stop an answer',
       description:
-        'Stop the Lab assistant answering in one of your chats: a question still queued is withdrawn; a running answer stops within about a second and keeps what it finished. A backtest it started keeps running. Needs POLYRANK_API_KEY.',
+        'Stop the AI Lab assistant answering in one of your chats: a question still queued is withdrawn; a running answer stops within about a second and keeps what it finished. A backtest it started keeps running. Needs POLYRANK_API_KEY.',
       inputSchema: z.object({ id: z.string().uuid() }),
       annotations: { ...WRITE, idempotentHint: true },
       _meta: LAB,

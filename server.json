@@ -3,7 +3,7 @@
   "name": "io.github.polyrank/polyrank-mcp",
   "title": "Polyrank",
   "description": "Polymarket trader analytics for AI agents: rank wallets, read trader metrics, backtest strategies.",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "repository": {
     "url": "https://github.com/polyrank/PolyRank-MCP",
     "source": "github"
@@ -21,7 +21,7 @@
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@polyrank/mcp",
-      "version": "0.5.0",
+      "version": "0.5.1",
       "transport": {
         "type": "stdio"
       },
@@ -40,7 +40,7 @@
         },
         {
           "name": "POLYRANK_API_KEY",
-          "description": "Optional Polyrank API key (pk_live_…). Enables the authenticated tools: polyrank_rank_wallets (the Ranking Builder), polyrank_get_trader_metrics, the Strategy Lab tools and tid resolve. Anonymous tools work without it.",
+          "description": "Optional Polyrank API key (pk_live_…). Enables the authenticated tools: polyrank_rank_wallets (the Ranking Builder), polyrank_get_trader_metrics, the AI Lab tools and tid resolve. Anonymous tools work without it.",
           "isRequired": false,
           "isSecret": true
         }
@@ -54,7 +54,7 @@
       "headers": [
         {
           "name": "Authorization",
-          "description": "Optional. Your Polyrank API key as a bearer token (pk_live_…, from https://polyrank.app/api-keys). Without it the 17 free read-only tools work; the Ranking Builder, per-window trader metrics and the Strategy Lab tools need it (the Lab tools need a paid plan with the Lab; results are simulated).",
+          "description": "Optional. Your Polyrank API key as a bearer token (pk_live_…, from https://polyrank.app/api-keys). Without it the 17 free read-only tools work; the Ranking Builder, per-window trader metrics and the AI Lab tools need it (they also need a paid plan with the AI Lab; results are simulated).",
           "isRequired": false,
           "isSecret": true,
           "value": "Bearer {api_key}",

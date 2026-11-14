@@ -8,14 +8,14 @@ lucky._ (Live coverage + the exact skill-metric count: `polyrank_get_platform_st
 
 The public tools wrap Polyrank's free API — no key. With a Polyrank API key
 (`POLYRANK_API_KEY`, from polyrank.app/api-keys on a plan with the Ranking
-Builder / Strategy Lab), the ranking, trader-metrics and Strategy Lab tools call the
+Builder / AI Lab), the ranking, trader-metrics and AI Lab tools call the
 authenticated API: **the same `POST /v1/rankings/custom` the Ranking Builder runs** —
 any of the 84 metrics at any window it exists at, every filter, `as_of` boards —
 plus per-window trader metrics and backtests / paper trading. Agents that pay per
 call instead of holding a key use the x402 agent API — see <https://polyrank.app/llms.txt>.
 
 Every tool carries a `title` and the MCP annotations `readOnlyHint`, `destructiveHint`, `idempotentHint` and
-`openWorldHint`: 29 tools are read-only; the 7 Strategy Lab writes (`polyrank_create_strategy`,
+`openWorldHint`: 29 tools are read-only; the 7 AI Lab writes (`polyrank_create_strategy`,
 `polyrank_run_backtest`, `polyrank_start_paper`, `polyrank_update_strategy`, `polyrank_lab_ask`, `polyrank_lab_reply`,
 `polyrank_lab_stop`) each create or change a record in your own Polyrank account and are marked
 `destructiveHint: false` (none deletes anything, none touches funds; the chat tools spend your plan's AI credits).
@@ -51,7 +51,7 @@ Read-only tools are listed first.
 | `polyrank_rank_wallets`       | The Ranking Builder: weights × windows × filters, `as_of`, explain, any sort |
 | `polyrank_get_trader_metrics` | One trader's every metric at a window: value + percentile (address or `tid`) |
 
-## Strategy Lab tools (need `POLYRANK_API_KEY` on a paid plan with the Lab; results are SIMULATED) — 16
+## AI Lab tools (need `POLYRANK_API_KEY` on a paid plan with the AI Lab; results are SIMULATED) — 16
 
 | Tool                          | What it does                                                       |
 | ----------------------------- | ------------------------------------------------------------------ |
@@ -64,25 +64,25 @@ Read-only tools are listed first.
 | `polyrank_list_strategies`    | Your strategies, filtered by state (draft, tested, paper…)         |
 | `polyrank_get_strategy`       | One strategy with its full spec                                    |
 | `polyrank_list_backtests`     | Your recent backtests, all or one strategy's                       |
-| `polyrank_get_lab_limits`     | Your plan's Lab limits and what is used, incl. chats at once       |
-| `polyrank_lab_list_chats`     | Your Lab assistant chats                                           |
+| `polyrank_get_lab_limits`     | Your plan's AI Lab limits and what is used, incl. chats at once    |
+| `polyrank_lab_list_chats`     | Your AI Lab assistant chats                                        |
 | `polyrank_lab_get_chat`       | One chat: answers, result cards, queue position                    |
 | `polyrank_update_strategy`    | Rename a strategy or replace its spec                              |
-| `polyrank_lab_ask`            | Ask the Lab assistant in a new chat (spends AI credits)            |
+| `polyrank_lab_ask`            | Ask the AI Lab assistant in a new chat (spends AI credits)         |
 | `polyrank_lab_reply`          | Reply in a chat (spends AI credits)                                |
 | `polyrank_lab_stop`           | Stop an answer                                                     |
 
-The Strategy Lab tools act as your own Polyrank account: a plan with the Lab (Pro Trader and up; a strategy that copies
+The AI Lab tools act as your own Polyrank account: a plan with the AI Lab (Pro Trader and up; a strategy that copies
 no wallet needs Lab Pro and up), each backtest counting against the plan's backtests a day, with `queue_position` and
 `eta_s` on a queued run. Plans and limits: <https://docs.polyrank.app/lab>.
 
-**The Lab assistant** (`polyrank_lab_ask`, `polyrank_lab_reply`): the same assistant as polyrank.app/lab, acting in
+**The AI Lab assistant** (`polyrank_lab_ask`, `polyrank_lab_reply`): the same assistant as polyrank.app/lab, acting in
 your account (research only; it never places orders). Each question spends your plan's AI credits (25 needed to start,
 a typical one about 13; `deep: true` about twice) and your plan answers a number of chats at once (Pro Trader 2, Lab
 Pro 3, Quant 4, Quant Max 6, Desk 6, Enterprise 8; one more answers 429 `lab_agent_busy`). The tool waits up to
 `wait_seconds` (default 45, at most 55) for the answer, then returns what is there; poll `polyrank_lab_get_chat` while
 `next` says it is still answering. A backtest the assistant starts that takes longer than a few seconds runs on:
-`awaiting_backtests` counts them, and each result is posted to the chat when it finishes. Every answer, and every Lab
+`awaiting_backtests` counts them, and each result is posted to the chat when it finishes. Every answer, and every AI Lab
 result with simulated figures (`polyrank_run_backtest`, `polyrank_get_backtest`, `polyrank_get_paper_run`,
 `polyrank_list_strategies`, `polyrank_list_backtests`), comes with the CFTC Rule 4.41 statement
 (`simulated_results_notice`).
@@ -121,7 +121,7 @@ code --add-mcp '{"name":"polyrank","command":"npx","args":["-y","@polyrank/mcp"]
 Config: `POLYRANK_API_BASE` (default `https://api.polyrank.app`),
 `POLYRANK_AGENT_BASE` (default `https://api-agent.polyrank.app`; only its free
 manifests are read), and optional `POLYRANK_API_KEY`, which unlocks the ranking,
-trader-metrics, Strategy Lab and `tid`-resolve tools. With a key:
+trader-metrics, AI Lab and `tid`-resolve tools. With a key:
 
 ```bash
 claude mcp add polyrank -e POLYRANK_API_KEY=pk_live_… -- npx -y @polyrank/mcp
@@ -131,11 +131,17 @@ claude mcp add polyrank -e POLYRANK_API_KEY=pk_live_… -- npx -y @polyrank/mcp
 
 Polyrank hosts this server at **`https://mcp.polyrank.app`** (Streamable HTTP), so nothing needs installing:
 
-| Endpoint                                   | Tools                                                                                                                                                                               |
-| ------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `POST https://mcp.polyrank.app/mcp`        | all **36**. The 17 free tools work with no header; the other 19 need `Authorization: Bearer pk_live_…` (your own key, your plan's limits) and otherwise answer that they need a key |
-| `POST https://mcp.polyrank.app/mcp/public` | the **17** free read-only tools only; any Authorization header is ignored                                                                                                           |
-| `GET https://mcp.polyrank.app/healthz`     | status and version                                                                                                                                                                  |
+| Endpoint                                   | Tools                                                                                                                                                                                                                                   |
+| ------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `POST https://mcp.polyrank.app/mcp`        | all **36**: the 17 free tools without sign-in; the other 19 after **sign-in** (OAuth 2.1: your MCP client opens Polyrank's sign-in and consent) or with `Authorization: Bearer pk_live_…` (your own key); your plan's limits either way |
+| `POST https://mcp.polyrank.app/mcp/public` | the **17** free read-only tools only; any Authorization header is ignored                                                                                                                                                               |
+| `GET https://mcp.polyrank.app/healthz`     | status and version                                                                                                                                                                                                                      |
+
+In Claude (Settings → Connectors → Add custom connector), ChatGPT or Cursor, add `https://mcp.polyrank.app/mcp`. In
+Claude's dialog choose **Sign in now** to connect your account up front (otherwise the free tools work and the app asks
+you to sign in at the first tool that needs your account): you sign in to Polyrank and approve what the app may do
+(read data; your AI Lab, optional). Disconnect it any time in Polyrank → Account → Connected apps. With a key
+instead:
 
 ```bash
 claude mcp add --transport http polyrank https://mcp.polyrank.app/mcp --header "Authorization: Bearer pk_live_…"
@@ -146,8 +152,8 @@ claude mcp add --transport http polyrank-free https://mcp.polyrank.app/mcp/publi
 ```
 
 It is for MCP clients and agent backends, not for pages in a browser: a request that carries a browser `Origin` header
-is refused (403). Limits: 100 requests a minute per address without a key, 600 a minute with a key, and your plan's
-API limits behind them. The 6 Strategy Lab tools need a paid plan with the Lab; their results are simulated.
+is refused (403). Limits: 100 requests a minute per address without sign-in or a key, 600 a minute with one, and your
+plan's API limits behind them. The 16 AI Lab tools need a paid plan with the AI Lab; their results are simulated.
 
 The package also runs this server itself (`MCP_HTTP_ENABLED=1`); with no flag it is the stdio server above.
 

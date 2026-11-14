@@ -13,6 +13,19 @@
  *   POST /mcp/public  the 17 free read-only tools only; an Authorization header is ignored and never forwarded. For a
  *                     listing that cannot pass a key (the Claude Connectors Directory takes OAuth or no auth).
  *   GET  /healthz     liveness: version and tool counts, no upstream call, no auth.
+ *   GET  /.well-known/mcp/server-card.json, /.well-known/mcp.json   the MCP Server Card (src/server_card.ts), no auth.
+ *   GET  /.well-known/oauth-protected-resource[/mcp]   RFC 9728 metadata (MCP_OAUTH_ENABLED=1 only): the resource and
+ *                     its authorization server (https://api.polyrank.app, apps/api/src/oauth). Any origin may read it.
+ *
+ * OAUTH (MCP authorization spec 2025-06-18; MCP_OAUTH_ENABLED=1, armed together with the api's OAUTH_ENABLED=1).
+ * `Authorization: Bearer <access token>` from the OAuth flow is accepted next to a pk_ key, checked the same way
+ * (once against the API, cached; the API maps the token to its user and plan exactly like a key, plus scope and
+ * audience). An anonymous tools/call of a tool that needs an account answers HTTP 401 with
+ * `WWW-Authenticate: Bearer resource_metadata="…/.well-known/oauth-protected-resource/mcp", scope="read lab"`, which
+ * is what starts a client's "Connect → sign in → approve" flow (MCP_OAUTH_REQUIRE_ON_CONNECT=1: every anonymous
+ * request to /mcp answers 401, for a client that only starts the flow at connect time). A token without the `lab`
+ * scope calling a Lab tool answers 403 insufficient_scope (step-up). A token that is refused, or expires within 30 s,
+ * answers 401 invalid_token so the client refreshes before the call rather than failing inside it.
  *
  * AUTH. The key is the caller's, per request. The process env POLYRANK_API_KEY is NEVER used here (a hosted server
  * that fell back to it would hand one account's key to every anonymous caller). A malformed Authorization header is a
@@ -40,6 +53,10 @@
  * LOGS. One JSON line per request on stdout (pino-style numeric level): request id, path, status, ms, the JSON-RPC
  * method and tool name, the caller class, a 12-hex SHA-256 fingerprint of the key and of the client address. Never
  * the key, never the address, never a tool's arguments or result.
+ *
+ * ANALYTICS (tracking-full 2026-11-07, analytics.ts). `mcp_connected` per `initialize` and `mcp_tool_called {tool}`
+ * per tool call go to PostHog in batches, keyed by the same fingerprints as the log (no person profile), only when
+ * POSTHOG_PROJECT_API_KEY is set. Never the key, the address, the arguments or the result.
  */
 import { createHash, randomUUID } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
@@ -47,21 +64,44 @@ import { BlockList, isIP } from 'node:net';
 import { createMcpHandler, type AuthInfo } from '@modelcontextprotocol/server';
 import { hostHeaderValidation, originValidation, toNodeHandler } from '@modelcontextprotocol/node';
 import {
+  ACCESS_META_KEY,
   createPolyrankServer,
   DEFAULT_AGENT_BASE,
   DEFAULT_API_BASE,
   VERSION,
   type Toolset,
 } from './index.js';
+import { mcpServerCard } from './server_card.js';
+import { createMcpAnalytics, mcpRequestEvents, type McpAnalytics } from './analytics.js';
 
 export const MCP_PATH = '/mcp';
 export const PUBLIC_PATH = '/mcp/public';
+const MCP_PUBLIC_HINT = 'https://mcp.polyrank.app/mcp/public';
 export const HEALTH_PATH = '/healthz';
+/** The MCP Server Card (src/server_card.ts), at the draft's path and at the shorter alias scanners also read. */
+export const SERVER_CARD_PATHS = [
+  '/.well-known/mcp/server-card.json',
+  '/.well-known/mcp.json',
+] as const;
 /** The tool counts per endpoint; tool_inventory.spec.ts pins them against what the server lists. */
 export const TOOL_COUNTS = { all: 36, public: 17 } as const;
 
 /** The API's own key format (apps/api/src/middleware/auth_api_key.ts PK_RE). */
-const BEARER_RE = /^Bearer\s+(pk_(?:live|test)_[A-Z2-7]{22})$/i;
+const KEY_RE = /^pk_(?:live|test)_[A-Z2-7]{22}$/i;
+/** An OAuth access token from the Polyrank authorization server (apps/api/src/oauth/access.ts OAUTH_TOKEN_RE). */
+export const OAUTH_TOKEN_RE = /^[A-Za-z0-9_-]{43}$/;
+const BEARER_RE = /^Bearer\s+(\S+)$/i;
+export const PRM_PATH = '/.well-known/oauth-protected-resource';
+
+export interface OAuthHttpConfig {
+  enabled: boolean;
+  /** The authorization server's issuer (RFC 8414), named in the protected-resource metadata. */
+  issuer: string;
+  /** This server's public origin (no path): the resource is `${publicUrl}/mcp`. */
+  publicUrl: string;
+  /** Answer 401 to every anonymous /mcp request, not only to a keyed tool call. */
+  requireOnConnect: boolean;
+}
 
 export interface HttpConfig {
   host: string;
@@ -79,6 +119,7 @@ export interface HttpConfig {
   /** Forward the caller's address as cf-connecting-ip on upstream calls (only where the API is reached directly). */
   forwardClientIp: boolean;
   maxBodyBytes: number;
+  oauth: OAuthHttpConfig;
 }
 
 const list = (v: string | undefined, dflt: string[]): string[] =>
@@ -111,7 +152,67 @@ export function httpConfigFromEnv(env: NodeJS.ProcessEnv = process.env): HttpCon
     keyPerMin: int(env['MCP_HTTP_KEY_PER_MIN'], 600),
     forwardClientIp: env['MCP_FORWARD_CLIENT_IP'] === '1',
     maxBodyBytes: int(env['MCP_HTTP_MAX_BODY_BYTES'], 1024 * 1024),
+    oauth: {
+      enabled: env['MCP_OAUTH_ENABLED'] === '1',
+      issuer: (env['MCP_OAUTH_ISSUER']?.trim() || 'https://api.polyrank.app').replace(/\/+$/, ''),
+      publicUrl: (env['MCP_PUBLIC_URL']?.trim() || 'https://mcp.polyrank.app').replace(/\/+$/, ''),
+      requireOnConnect: env['MCP_OAUTH_REQUIRE_ON_CONNECT'] === '1',
+    },
   };
+}
+
+/** RFC 9728 metadata. `/…/mcp` describes the /mcp endpoint (what clients read); the root form, the origin. */
+export function protectedResourceMetadata(
+  o: OAuthHttpConfig,
+  path: string,
+): Record<string, unknown> {
+  return {
+    resource: path === `${PRM_PATH}${MCP_PATH}` ? `${o.publicUrl}${MCP_PATH}` : o.publicUrl,
+    authorization_servers: [o.issuer],
+    scopes_supported: ['read', 'lab'],
+    bearer_methods_supported: ['header'],
+    resource_name: 'Polyrank',
+    resource_documentation: 'https://docs.polyrank.app/mcp',
+  };
+}
+
+export const resourceMetadataUrl = (o: OAuthHttpConfig): string =>
+  `${o.publicUrl}${PRM_PATH}${MCP_PATH}`;
+
+/** The WWW-Authenticate value of a 401/403 on /mcp (RFC 6750 §3 + RFC 9728 §5.1). */
+export function oauthChallenge(
+  o: OAuthHttpConfig,
+  error?: 'invalid_token' | 'insufficient_scope',
+  description?: string,
+): string {
+  return [
+    'Bearer realm="polyrank"',
+    ...(error ? [`error="${error}"`] : []),
+    ...(description ? [`error_description="${description}"`] : []),
+    'scope="read lab"',
+    `resource_metadata="${resourceMetadataUrl(o)}"`,
+  ].join(', ');
+}
+
+/**
+ * The tools that need an account (`_meta` access `api_key` or `lab`), and the Lab ones, read once from the server
+ * definition itself so the 401 / step-up rules can never drift from the tool list (tool_inventory.spec pins 19 / 16).
+ */
+export function accessTiers(): { keyed: Set<string>; lab: Set<string> } {
+  const server = createPolyrankServer({ transport: 'http', toolset: 'all' });
+  const tools = (
+    server as unknown as { _registeredTools?: Record<string, { _meta?: Record<string, unknown> }> }
+  )._registeredTools;
+  if (tools === undefined || Object.keys(tools).length !== TOOL_COUNTS.all)
+    throw new Error('accessTiers: cannot read the registered tools from the MCP server');
+  const keyed = new Set<string>();
+  const lab = new Set<string>();
+  for (const [name, t] of Object.entries(tools)) {
+    const tier = t._meta?.[ACCESS_META_KEY];
+    if (tier !== 'free') keyed.add(name);
+    if (tier === 'lab') lab.add(name);
+  }
+  return { keyed, lab };
 }
 
 export const fingerprint = (s: string): string =>
@@ -154,19 +255,40 @@ export class MinuteLimiter {
 }
 
 export type KeyCheck = 'valid' | 'invalid' | 'unknown';
+export interface KeyCheckResult {
+  result: KeyCheck;
+  /** OAuth tokens only (the API's X-OAuth-Scope / X-OAuth-Expires-At answer headers). */
+  scopes?: string[];
+  /** Unix ms. */
+  expiresAt?: number;
+}
 
-/** The API's answer on a key, cached by fingerprint: 10 min for a valid key, 1 min for a refused one. */
+/**
+ * The API's answer on a key or an OAuth token, cached by fingerprint: 10 min for a valid key, 1 min for a refused
+ * one; a valid OAuth token for 1 min at most and never past its own expiry (a disconnected app stops within a minute
+ * here; the API refuses it at once).
+ */
 export class KeyVerifier {
-  private readonly cache = new Map<string, { result: 'valid' | 'invalid'; until: number }>();
+  private readonly cache = new Map<
+    string,
+    KeyCheckResult & { result: 'valid' | 'invalid'; until: number }
+  >();
   constructor(
     private readonly apiBase: string,
     private readonly doFetch: typeof fetch,
     private readonly maxEntries = 10_000,
   ) {}
   async check(token: string, now: number, extraHeaders: Record<string, string>): Promise<KeyCheck> {
+    return (await this.checkDetailed(token, now, extraHeaders)).result;
+  }
+  async checkDetailed(
+    token: string,
+    now: number,
+    extraHeaders: Record<string, string>,
+  ): Promise<KeyCheckResult> {
     const fp = fingerprint(token);
     const hit = this.cache.get(fp);
-    if (hit !== undefined && hit.until > now) return hit.result;
+    if (hit !== undefined && hit.until > now) return hit;
     let res: Response;
     try {
       res = await this.doFetch(`${this.apiBase}/v1/stats/overview`, {
@@ -179,21 +301,34 @@ export class KeyVerifier {
         signal: AbortSignal.timeout(10_000),
       });
     } catch {
-      return 'unknown';
+      return { result: 'unknown' };
     }
     let result: 'valid' | 'invalid' | null = null;
     if (res.status === 401) {
       const body = (await res.json().catch(() => null)) as { error?: unknown } | null;
-      result = body?.error === 'invalid_api_key' ? 'invalid' : null;
+      result =
+        body?.error === 'invalid_api_key' || body?.error === 'invalid_token' ? 'invalid' : null;
     } else if (res.ok || res.status === 429) {
       // 429 comes after the key resolved (auth_api_key.ts checks the key, then the quota): the key exists.
       result = 'valid';
     }
+    const scopeHeader = res.headers.get('x-oauth-scope');
+    const expHeader = Number(res.headers.get('x-oauth-expires-at'));
     await res.body?.cancel().catch(() => undefined);
-    if (result === null) return 'unknown';
-    if (this.cache.size >= this.maxEntries) this.cache.delete(this.cache.keys().next().value!);
-    this.cache.set(fp, { result, until: now + (result === 'valid' ? 600_000 : 60_000) });
-    return result;
+    if (result === null) return { result: 'unknown' };
+    const detail: KeyCheckResult & { result: 'valid' | 'invalid' } = {
+      result,
+      ...(scopeHeader !== null ? { scopes: scopeHeader.split(/\s+/).filter(Boolean) } : {}),
+      ...(Number.isFinite(expHeader) && expHeader > 0 ? { expiresAt: expHeader * 1000 } : {}),
+    };
+    let until = now + (result === 'valid' ? 600_000 : 60_000);
+    if (result === 'valid' && OAUTH_TOKEN_RE.test(token))
+      until = Math.min(now + 60_000, (detail.expiresAt ?? now + 60_000) - 30_000);
+    if (until > now) {
+      if (this.cache.size >= this.maxEntries) this.cache.delete(this.cache.keys().next().value!);
+      this.cache.set(fp, { ...detail, until });
+    }
+    return detail;
   }
 }
 
@@ -232,6 +367,8 @@ export interface HttpDeps {
   fetch?: typeof fetch;
   log?: (rec: LogRecord) => void;
   now?: () => number;
+  /** product analytics (analytics.ts); default: from the env (a no-op without POSTHOG_PROJECT_API_KEY) */
+  analytics?: McpAnalytics;
 }
 
 function sendJson(
@@ -270,6 +407,18 @@ async function readBody(req: IncomingMessage, max: number): Promise<string> {
 }
 
 /** The JSON-RPC method(s) and tool name of a parsed body, for the request log. */
+/** Every tools/call name in a body (a batch may carry several); what the 401 and step-up rules look at. */
+function calledTools(body: unknown): string[] {
+  const out: string[] = [];
+  for (const m of Array.isArray(body) ? body : [body]) {
+    if (m === null || typeof m !== 'object') continue;
+    const name = (m as { params?: { name?: unknown } }).params?.name;
+    if ((m as { method?: unknown }).method === 'tools/call' && typeof name === 'string')
+      out.push(name);
+  }
+  return out;
+}
+
 function describeRpc(body: unknown): { rpc?: string; tool?: string } {
   const msgs = Array.isArray(body) ? body : [body];
   const methods: string[] = [];
@@ -297,8 +446,23 @@ export function createHttpServer(cfg: HttpConfig, deps: HttpDeps = {}): Polyrank
   const doFetch = deps.fetch ?? fetch;
   const log = deps.log ?? writeLog;
   const now = deps.now ?? Date.now;
+  const analytics =
+    deps.analytics ??
+    createMcpAnalytics(process.env, {
+      onError: (m) =>
+        log({
+          level: 40,
+          time: new Date(now()).toISOString(),
+          service: 'polyrank-mcp',
+          msg: 'mcp_analytics_failed',
+          err: m,
+        }),
+    });
   const limiter = new MinuteLimiter();
   const verifier = new KeyVerifier(cfg.apiBase, doFetch);
+  const tiers = cfg.oauth.enabled
+    ? accessTiers()
+    : { keyed: new Set<string>(), lab: new Set<string>() };
   const validateHost = hostHeaderValidation(cfg.allowedHosts);
   const validateOrigin = originValidation(cfg.allowedOrigins);
 
@@ -350,6 +514,49 @@ export function createHttpServer(cfg: HttpConfig, deps: HttpDeps = {}): Polyrank
     rec['path'] = path;
     const method = req.method ?? 'GET';
 
+    if (cfg.oauth.enabled && (path === PRM_PATH || path === `${PRM_PATH}${MCP_PATH}`)) {
+      // Public metadata: any origin (the MCP Inspector reads it from a browser), cacheable.
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      if (method === 'OPTIONS') {
+        res.writeHead(204, {
+          'Access-Control-Allow-Methods': 'GET, OPTIONS',
+          'Access-Control-Max-Age': '600',
+        });
+        return void res.end();
+      }
+      if (method !== 'GET' && method !== 'HEAD')
+        return sendJson(res, 405, { error: 'method_not_allowed' }, { Allow: 'GET, HEAD' });
+      res.writeHead(200, {
+        'Content-Type': 'application/json',
+        'Cache-Control': 'public, max-age=3600',
+      });
+      return void res.end(JSON.stringify(protectedResourceMetadata(cfg.oauth, path)));
+    }
+    if (path === '/') {
+      // A 200 root for crawlers and readiness scanners (isitagentready stops at a 404 root, 2026-11-07): a pointer
+      // to the real endpoints and the discovery documents, nothing more. Public, cacheable, any origin.
+      if (method !== 'GET' && method !== 'HEAD')
+        return sendJson(res, 405, { error: 'method_not_allowed' }, { Allow: 'GET, HEAD' });
+      return sendJson(
+        res,
+        200,
+        {
+          name: 'Polyrank MCP server',
+          version: VERSION,
+          docs: 'https://docs.polyrank.app/mcp',
+          endpoints: {
+            [MCP_PATH]: `${TOOL_COUNTS.all} tools: 17 free + account tools with a Polyrank API key or OAuth`,
+            [PUBLIC_PATH]: `${TOOL_COUNTS.public} free tools, no auth`,
+          },
+          discovery: {
+            server_card: SERVER_CARD_PATHS[1],
+            health: HEALTH_PATH,
+            ...(cfg.oauth.enabled ? { protected_resource: `${PRM_PATH}${MCP_PATH}` } : {}),
+          },
+        },
+        { 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'public, max-age=3600' },
+      );
+    }
     if (path === HEALTH_PATH) {
       if (method !== 'GET' && method !== 'HEAD')
         return sendJson(res, 405, { error: 'method_not_allowed' }, { Allow: 'GET, HEAD' });
@@ -359,6 +566,22 @@ export function createHttpServer(cfg: HttpConfig, deps: HttpDeps = {}): Polyrank
         version: VERSION,
         transport: 'streamable-http',
         endpoints: { [MCP_PATH]: TOOL_COUNTS.all, [PUBLIC_PATH]: TOOL_COUNTS.public },
+      });
+    }
+    if ((SERVER_CARD_PATHS as readonly string[]).includes(path)) {
+      if (method !== 'GET' && method !== 'HEAD')
+        return sendJson(res, 405, { error: 'method_not_allowed' }, { Allow: 'GET, HEAD' });
+      // Public discovery metadata: readable cross-origin, cacheable (it changes with a release, not per request).
+      const card = cfg.oauth.enabled
+        ? mcpServerCard({
+            issuer: cfg.oauth.issuer,
+            resourceMetadata: resourceMetadataUrl(cfg.oauth),
+            requireOnConnect: cfg.oauth.requireOnConnect,
+          })
+        : mcpServerCard();
+      return sendJson(res, 200, card, {
+        'Access-Control-Allow-Origin': '*',
+        'Cache-Control': 'public, max-age=3600',
       });
     }
     const toolset: Toolset | null =
@@ -415,53 +638,89 @@ export function createHttpServer(cfg: HttpConfig, deps: HttpDeps = {}): Polyrank
     res.setHeader('X-RateLimit-Remaining', String(ipHit.remaining));
     if (!ipHit.ok) return tooMany(ipLimit, 'caller', ipHit.retryAfterSec);
 
+    const challenge401 = (
+      refused: string,
+      error: 'invalid_token' | undefined,
+      message: string,
+      description?: string,
+      bodyError?: string,
+    ) => {
+      rec['refused'] = refused;
+      return sendJson(
+        res,
+        401,
+        { error: bodyError ?? error ?? 'unauthorized', message },
+        {
+          'WWW-Authenticate': cfg.oauth.enabled
+            ? oauthChallenge(cfg.oauth, error, description)
+            : `Bearer realm="polyrank"${error ? `, error="${error}"` : ''}${description ? `, error_description="${description}"` : ''}`,
+        },
+      );
+    };
+    const howToConnect = cfg.oauth.enabled
+      ? 'Connect with OAuth (your client signs you in to Polyrank), or send a Polyrank API key as "Authorization: Bearer pk_live_…" (https://polyrank.app/api-keys).'
+      : 'Send a Polyrank API key as "Authorization: Bearer pk_live_…" (create one at https://polyrank.app/api-keys), or no Authorization header for the free tools.';
+
     let token: string | undefined;
+    let tokenKind: 'key' | 'oauth' | undefined;
+    let tokenScopes: string[] | undefined;
     if (bearing) {
-      const m = BEARER_RE.exec(authz!.trim());
-      if (m === null) {
-        rec['refused'] = 'auth_format';
-        return sendJson(
-          res,
-          401,
-          {
-            error: 'invalid_token',
-            message:
-              'Send a Polyrank API key as "Authorization: Bearer pk_live_…" (create one at https://polyrank.app/api-keys), or no Authorization header for the free tools.',
-          },
-          {
-            'WWW-Authenticate':
-              'Bearer realm="polyrank", error="invalid_token", error_description="expected a pk_live_ or pk_test_ API key"',
-          },
+      const raw = BEARER_RE.exec(authz!.trim())?.[1];
+      tokenKind =
+        raw !== undefined && KEY_RE.test(raw)
+          ? 'key'
+          : raw !== undefined && cfg.oauth.enabled && OAUTH_TOKEN_RE.test(raw)
+            ? 'oauth'
+            : undefined;
+      if (tokenKind === undefined)
+        return challenge401(
+          'auth_format',
+          'invalid_token',
+          howToConnect,
+          cfg.oauth.enabled
+            ? 'expected an OAuth access token or a pk_live_ API key'
+            : 'expected a pk_live_ or pk_test_ API key',
         );
-      }
-      token = m[1]!;
+      token = raw!;
       rec['key_fp'] = fingerprint(token);
       if (cfg.verifyKeys) {
-        const check = await verifier.check(
+        const check = await verifier.checkDetailed(
           token,
           now(),
           cfg.forwardClientIp ? { 'cf-connecting-ip': ip } : {},
         );
-        rec['key_check'] = check;
-        if (check === 'invalid') {
-          rec['refused'] = 'auth_key';
-          return sendJson(
-            res,
-            401,
-            {
-              error: 'invalid_api_key',
-              message:
+        rec['key_check'] = check.result;
+        if (check.result === 'invalid')
+          return tokenKind === 'oauth'
+            ? challenge401(
+                'auth_token',
+                'invalid_token',
+                'The access token is expired or was revoked. Refresh it or connect again.',
+                'the access token was not accepted',
+              )
+            : challenge401(
+                'auth_key',
+                'invalid_token',
                 'Polyrank did not accept this API key (revoked or mistyped). Create or copy a key at https://polyrank.app/api-keys.',
-            },
-            {
-              'WWW-Authenticate':
-                'Bearer realm="polyrank", error="invalid_token", error_description="the API key was not accepted"',
-            },
+                'the API key was not accepted',
+                'invalid_api_key',
+              );
+        // A token that dies within 30 s: refused now, so the client refreshes BEFORE the call instead of inside it.
+        if (
+          tokenKind === 'oauth' &&
+          check.expiresAt !== undefined &&
+          check.expiresAt - now() < 30_000
+        )
+          return challenge401(
+            'auth_token_expiring',
+            'invalid_token',
+            'The access token is about to expire. Refresh it.',
+            'the access token expired',
           );
-        }
+        tokenScopes = check.scopes;
       }
     }
-    rec['caller'] = token ? 'key' : 'anon';
+    rec['caller'] = tokenKind ?? 'anon';
 
     if (token !== undefined) {
       const keyHit = limiter.hit(`key:${fingerprint(token)}`, cfg.keyPerMin, now());
@@ -495,10 +754,49 @@ export function createHttpServer(cfg: HttpConfig, deps: HttpDeps = {}): Polyrank
       Object.assign(rec, describeRpc(parsedBody));
     }
 
+    if (cfg.oauth.enabled && toolset === 'all') {
+      const called = calledTools(parsedBody);
+      // Anonymous: the 401 that starts the client's OAuth flow (RFC 9728 §5.1), on a tool that needs an account,
+      // or on any request when the server is set to require sign-in at connect.
+      if (
+        token === undefined &&
+        (cfg.oauth.requireOnConnect || called.some((t) => tiers.keyed.has(t)))
+      )
+        return challenge401(
+          'auth_required',
+          undefined,
+          `This needs a Polyrank account. ${howToConnect} The free tools also work without sign-in at ${MCP_PUBLIC_HINT}.`,
+        );
+      // Step-up (insufficient_scope): an OAuth token approved without the AI Lab calling a Lab tool.
+      if (
+        tokenKind === 'oauth' &&
+        tokenScopes !== undefined &&
+        !tokenScopes.includes('lab') &&
+        called.some((t) => tiers.lab.has(t))
+      ) {
+        rec['refused'] = 'scope';
+        return sendJson(
+          res,
+          403,
+          {
+            error: 'insufficient_scope',
+            message: 'This AI Lab tool needs the "lab" scope: reconnect and approve the AI Lab.',
+          },
+          {
+            'WWW-Authenticate': oauthChallenge(
+              cfg.oauth,
+              'insufficient_scope',
+              'the AI Lab tools need the lab scope',
+            ),
+          },
+        );
+      }
+    }
+
     const auth: AuthInfo = {
       token: token ?? '',
-      clientId: token ? `key:${fingerprint(token)}` : 'anonymous',
-      scopes: [],
+      clientId: token ? `${tokenKind}:${fingerprint(token)}` : 'anonymous',
+      scopes: tokenScopes ?? [],
       extra: { clientIp: ip },
     };
     (req as IncomingMessage & { auth?: AuthInfo }).auth = auth;
@@ -527,6 +825,8 @@ export function createHttpServer(cfg: HttpConfig, deps: HttpDeps = {}): Polyrank
         status: res.statusCode,
         ms: Math.round(performance.now() - t0),
       });
+      // mcp_connected / mcp_tool_called counts (fingerprints only; analytics.ts)
+      for (const e of mcpRequestEvents({ ...rec, status: res.statusCode })) analytics.record(e);
     });
     handle(req, res, rec).catch((err: unknown) => {
       rec['err'] = err instanceof Error ? err.message : String(err);
@@ -541,7 +841,11 @@ export function createHttpServer(cfg: HttpConfig, deps: HttpDeps = {}): Polyrank
   return {
     server,
     close: async () => {
-      await Promise.all([handlers.all.handler.close(), handlers.public.handler.close()]);
+      await Promise.all([
+        handlers.all.handler.close(),
+        handlers.public.handler.close(),
+        analytics.close(),
+      ]);
       await new Promise<void>((resolve) => server.close(() => resolve()));
     },
   };
@@ -575,6 +879,13 @@ export async function startHttpServer(
     anon_per_min: cfg.anonPerMin,
     key_per_min: cfg.keyPerMin,
     forward_client_ip: cfg.forwardClientIp,
+    oauth: cfg.oauth.enabled
+      ? {
+          issuer: cfg.oauth.issuer,
+          resource: `${cfg.oauth.publicUrl}${MCP_PATH}`,
+          require_on_connect: cfg.oauth.requireOnConnect,
+        }
+      : false,
   });
   let stopping = false;
   const stop = (signal: string) => {
